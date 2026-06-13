@@ -82,7 +82,7 @@ add_custom_command(
     OUTPUT  ${_virtfs_outputs}
     COMMAND ${CMAKE_COMMAND}
         -D "MILLENNIUM_BASE=${MILLENNIUM_BASE}"
-        -D "CMAKE_BUILD_TYPE=${CMAKE_BUILD_TYPE}"
+        -D "CMAKE_BUILD_TYPE=$<CONFIG>"
         -P "${MILLENNIUM_BASE}/scripts/cmake/generate_virtfs.cmake"
     DEPENDS
         "${TS_STAMPS}/sdk.stamp"
