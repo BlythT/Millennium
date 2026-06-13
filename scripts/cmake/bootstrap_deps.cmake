@@ -125,6 +125,11 @@ if(DISTRO_NIX)
     set(CMAKE_CXX_FLAGS "${_saved_cxx_flags}")
 else()
     set(THIRDPARTY_DIR "${MILLENNIUM_BASE}/thirdparty")
+    
+    # Strip the 'd' debug suffix off third-party MSVC libraries (specifically zlib-ng)
+    # This natively fixes the linker error where libcurl explicitly hunts for 'zlibstatic.lib'
+    set(CMAKE_DEBUG_POSTFIX "" CACHE STRING "" FORCE)
+
     FetchContent_Declare(zlib          URL "file://${THIRDPARTY_DIR}/zlib-2.2.5.tar.gz"           DOWNLOAD_EXTRACT_TIMESTAMP TRUE)
     FetchContent_Declare(luajit        SOURCE_DIR "${MILLENNIUM_BASE}/thirdparty/forks/luajit"      SOURCE_SUBDIR fakedir)
     FetchContent_Declare(nlohmann_json URL "file://${THIRDPARTY_DIR}/nlohmann_json-v3.12.0.tar.gz" DOWNLOAD_EXTRACT_TIMESTAMP TRUE SOURCE_SUBDIR fakedir)
