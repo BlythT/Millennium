@@ -45,40 +45,22 @@
 #include <regex>
 #include <shared_mutex>
 #include <string>
+#include <unordered_map>
 #include <vector>
-#include <unordered_set>
 
 extern std::atomic<unsigned long long> g_hookedModuleId;
 std::string get_cdp_isolated_ctx_script();
 
-/**
- * Millennium will not load JavaScript into the following URLs to favor user safety.
- * This is a list of URLs that may have sensitive information or are not safe to load JavaScript into.
- */
-static const std::vector<std::string> g_js_hook_blacklist = { "https://checkout\\.steampowered\\.com/.*" };
+/** Millennium will not load JavaScript into the following URLs (CSS injection is still allowed). */
+extern const std::vector<std::regex> g_js_hook_blacklist;
 
 /** Canonical list of Steam-owned TLDs. Both the CDP network interceptor and the webkit world manager derive their domain checks from this. */
 static constexpr const char* k_steam_tlds[] = {
     "steampowered.com", "steamcommunity.com", "steamgames.com", "steam-chat.com", "steamstatic.com",
 };
 static constexpr const char* k_steam_loopback = "steamloopback.host";
-
-// clang-format off
 /** Millennium will not hook the following URLs to favor user safety. (Neither JavaScript nor CSS will be injected into these URLs.) */
-static const std::unordered_set<std::string> g_js_and_css_hook_blacklist = {
-    /** Ignore paypal related content */
-    R"(https?:\/\/(?:[\w-]+\.)*paypal\.com\/[^\s"']*)",
-    R"(https?:\/\/(?:[\w-]+\.)*paypalobjects\.com\/[^\s"']*)",
-    R"(https?:\/\/(?:[\w-]+\.)*recaptcha\.net\/[^\s"']*)",
-
-    /** Ignore youtube related content */
-    R"(https?://(?:[\w-]+\.)*(?:youtube(?:-nocookie)?|youtu|ytimg|googlevideo|googleusercontent|studioyoutube)\.com/[^\s"']*)",
-    R"(https?://(?:[\w-]+\.)*youtu\.be/[^\s"']*)",
-
-    /** Ignore Chrome Web Store (causes a webhelper crash on Fetch.fulfillRequest) */
-    R"(https?:\/\/(?:[\w-]+\.)*chromewebstore\.google\.com\/[^\s"']*)",
-};
-// clang-format on
+extern const std::vector<std::regex> g_js_and_css_hook_blacklist;
 
 class network_hook_ctl
 {
@@ -113,6 +95,9 @@ class network_hook_ctl
     std::vector<hook_item> get_hook_list() const;
 
     void set_dynamic_css_provider(std::function<std::pair<std::string, std::string>()> provider);
+
+    void register_virtual_resource(const std::string& url, std::function<std::string()> producer);
+    void unregister_virtual_resource(const std::string& url);
 
     void shutdown();
     const char* get_ftp_url() const
@@ -164,6 +149,9 @@ class network_hook_ctl
     };
 
     std::function<std::pair<std::string, std::string>()> m_dynamic_css_provider;
+
+    mutable std::shared_mutex m_virtual_res_mtx;
+    std::unordered_map<std::string, std::function<std::string()>> m_virtual_resources;
 
     std::atomic<bool> m_shutdown{ false };
     mutable std::shared_mutex m_hook_list_mtx;

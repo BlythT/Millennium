@@ -49,6 +49,7 @@
 #ifndef _WIN32
 #include <sys/socket.h>
 #include <unistd.h>
+#include <poll.h>
 #endif
 
 /**
@@ -112,10 +113,16 @@ inline bool recv_all(socket_fd fd, void* buf, size_t n)
     while (total < n) {
 #ifdef _WIN32
         int r = ::recv(fd, static_cast<char*>(buf) + total, static_cast<int>(n - total), 0);
+        if (r == 0) return false; /* peer closed */
+        if (r < 0) return false;  /* real error */
 #else
         ssize_t r = ::recv(fd, static_cast<char*>(buf) + total, n - total, 0);
+        if (r == 0) return false; /* peer closed */
+        if (r < 0) {
+            if (errno == EINTR) continue; /* signal, retry */
+            return false;
+        }
 #endif
-        if (r <= 0) return false;
         total += static_cast<size_t>(r);
     }
     return true;
@@ -186,5 +193,19 @@ inline void close_fd(socket_fd fd)
     ::close(fd);
 #endif
 }
+
+#ifdef _WIN32
+using poll_fd_t = WSAPOLLFD;
+inline int sys_poll(WSAPOLLFD* fds, ULONG n, int ms)
+{
+    return ::WSAPoll(fds, n, ms);
+}
+#else
+using poll_fd_t = struct pollfd;
+inline int sys_poll(struct pollfd* fds, nfds_t n, int ms)
+{
+    return ::poll(fds, n, ms);
+}
+#endif
 
 } // namespace plugin_ipc

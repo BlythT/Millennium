@@ -32,6 +32,7 @@
 #include "millennium/linux_distro_helpers.h"
 #include "head/library_updater.h"
 #include "mep/crash_event_bus.h"
+#include "mep/log_normalize.h"
 #include "head/scan.h"
 #include "head/theme_cfg.h"
 #include "head/webkit.h"
@@ -46,6 +47,7 @@
 #include "millennium/plugin_loader.h"
 #include "millennium/logger.h"
 #include "millennium/config.h"
+#include "millennium/crypto.h"
 #include "millennium/file_watcher.h"
 #include "millennium/filesystem.h"
 #include "millennium/plugin_config.h"
@@ -308,11 +310,44 @@ builtin_payload head::millennium_backend::Core_GetEnvironmentVar(const builtin_p
 }
 builtin_payload head::millennium_backend::Core_GetBackendConfig(const builtin_payload&)
 {
-    return CONFIG.get_all();
+    auto cfg = CONFIG.get_all();
+
+    if (cfg.contains("network") && cfg["network"].contains("proxyPassword") && cfg["network"]["proxyPassword"].is_string())
+    {
+        const auto stored = cfg["network"]["proxyPassword"].get<std::string>();
+        cfg["network"]["proxyPassword"] = stored.empty() ? "" : std::string(Crypto::STORED_SENTINEL);
+    }
+
+    return cfg;
 }
 builtin_payload head::millennium_backend::Core_SetBackendConfig(const builtin_payload& args)
 {
-    return CONFIG.set_all(nlohmann::json::parse(args["config"].get<std::string>()), args.value("skipPropagation", false));
+    auto incoming = nlohmann::json::parse(args["config"].get<std::string>());
+
+    if (incoming.contains("network") && incoming["network"].contains("proxyPassword"))
+    {
+        const auto& pw = incoming["network"]["proxyPassword"].get<std::string>();
+
+        if (pw == std::string(Crypto::STORED_SENTINEL))
+        {
+            /*
+             * frontend didn't change the password, restore the currently stored
+             * encrypted value so set_all doesn't clobber it.
+             */
+            incoming["network"]["proxyPassword"] = CONFIG.get({ "network", "proxyPassword" }, "");
+        }
+        else if (!pw.empty())
+        {
+            const std::string encrypted = Crypto::encrypt(pw);
+            if (!encrypted.empty())
+                incoming["network"]["proxyPassword"] = encrypted;
+            else
+                incoming["network"].erase("proxyPassword");
+        }
+        /* pw == "" means user explicitly cleared the field */
+    }
+
+    return CONFIG.set_all(incoming, args.value("skipPropagation", false));
 }
 
 /** Theme and Plugin update API */
@@ -593,14 +628,22 @@ builtin_payload head::millennium_backend::Core_GetPluginBackendLogs(const builti
     std::vector<plugin_manager::plugin_t> plugins = m_plugin_manager->get_all_plugins();
 
     for (auto& logger : get_plugin_logger_mgr()) {
-        nlohmann::json logDataItem;
+        nlohmann::json logDataItem = nlohmann::json::array();
 
-        for (auto [message, logLevel, timestamp] : logger->collect_logs()) {
-            logDataItem.push_back({
-                { "message",   Base64Encode(message) },
-                { "level",     logLevel              },
-                { "timestamp", timestamp             }
-            });
+        for (auto& entry : mep::collect_log_snapshot(*logger, 200)) {
+            const std::string level = entry.value("level", std::string{ "info" });
+
+            nlohmann::json item = {
+                { "message",   Base64Encode(entry.value("message", std::string{})) },
+                { "level",     level == "error" ? 2 : level == "warn" ? 1 : 0       },
+                { "timestamp", format_log_timestamp(entry.value("timestamp_us", uint64_t(0))) },
+                { "source",    entry.value("source", std::string{ "backend" })      },
+            };
+            if (entry.contains("file")) {
+                item["file"] = entry["file"];
+                item["line"] = entry.value("line", 0);
+            }
+            logDataItem.push_back(std::move(item));
         }
 
         std::string pluginName = logger->get_plugin_name(false);

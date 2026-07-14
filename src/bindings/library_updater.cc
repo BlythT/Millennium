@@ -49,15 +49,23 @@ void head::library_updater::init(std::shared_ptr<plugin_manager> plugin_manager)
     theme_updater = std::make_shared<theme_installer>(plugin_manager, shared_from_this());
     plugin_updater = std::make_shared<plugin_installer>(m_millennium_backend, plugin_manager, shared_from_this());
 
-    if (!CONFIG.get({ "general", "checkForPluginAndThemeUpdates" }).get<bool>()) {
+    bool updates_enabled = CONFIG.get({ "general", "checkForPluginAndThemeUpdates" }).get<bool>();
+
+    if (!updates_enabled) {
         logger.warn("User has disabled update checking for plugins and themes.");
+        std::lock_guard<std::mutex> lock(m_updates_mutex);
+        cached_updates = json{
+            { "themes",  json::array() },
+            { "plugins", json::array() }
+        };
+        m_has_checked_for_updates = true;
         return;
     }
 
     m_update_future = std::async(std::launch::async, [self = shared_from_this()]()
     {
-        self->check_for_updates();
-    });
+        self->fetch_updates_from_network();
+    }).share();
 }
 
 bool head::library_updater::download_plugin_update(const std::string& id, const std::string& name, const std::string& commit)
@@ -92,25 +100,17 @@ bool head::library_updater::has_checked_for_updates() const
     return m_has_checked_for_updates;
 }
 
-std::optional<json> head::library_updater::check_for_updates(bool force)
+std::optional<json> head::library_updater::fetch_updates_from_network()
 {
     try {
-        {
-            std::lock_guard<std::mutex> lock(m_updates_mutex);
-            if (!force && cached_updates.has_value()) {
-                logger.log("Using cached updates.");
-                return cached_updates;
-            }
-        }
-
         auto plugins = plugin_updater->get_updater_request_body();
         auto themes = theme_updater->get_request_body();
+        bool has_theme_post_body = themes.contains("post_body") && themes["post_body"].is_array() && !themes["post_body"].empty();
 
         json request_body;
 
         if (!plugins.empty()) request_body["plugins"] = plugins;
-
-        if (themes.contains("post_body") && themes["post_body"].is_array() && !themes["post_body"].empty()) request_body["themes"] = themes["post_body"];
+        if (has_theme_post_body) request_body["themes"] = themes["post_body"];
 
         if (request_body.empty()) {
             logger.log("No themes or plugins to update!");
@@ -125,15 +125,20 @@ std::optional<json> head::library_updater::check_for_updates(bool force)
         }
 
         auto response_str = Http::Post(api_url.c_str(), request_body.dump());
-        json resp = json::parse(response_str);
+        json resp;
+        try {
+            resp = json::parse(response_str);
+        } catch (const std::exception& parse_err) {
+            logger.warn("Failed to parse update API response: {}", parse_err.what());
+            throw;
+        }
 
         if (resp.contains("themes") && !resp["themes"].empty() && !resp["themes"].contains("error")) {
             logger.log("[update-check] API returned {} theme(s), processing...", resp["themes"].size());
-            for (const auto& t : resp["themes"]) {
-                logger.log("[update-check] API theme name='{}' commit='{}'", t.value("name", "?"), t.value("commit", "?"));
-            }
             resp["themes"] = theme_updater->process_update(themes["update_query"], resp["themes"]);
             logger.log("[update-check] After filtering: {} theme(s) have updates", resp["themes"].size());
+        } else if (resp.contains("themes") && resp["themes"].contains("error")) {
+            logger.warn("[update-check] Theme update check returned an error: {}", resp["themes"].value("error", "?"));
         }
 
         {
@@ -143,11 +148,35 @@ std::optional<json> head::library_updater::check_for_updates(bool force)
         }
         return resp;
     } catch (const std::exception& e) {
-        logger.log(std::string("An error occurred while checking for updates: ") + e.what());
+        logger.warn("An error occurred while checking for updates: {}", e.what());
+        /* Do not cache — allow the next call to retry after a transient failure. */
         return json{
-            { "themes", { { "error", e.what() } } }
+            { "themes",  { { "error", e.what() } } },
+            { "plugins", json::array()              }
         };
     }
+}
+
+std::optional<json> head::library_updater::check_for_updates(bool force)
+{
+    {
+        std::lock_guard<std::mutex> lock(m_updates_mutex);
+        if (!force && cached_updates.has_value()) {
+            logger.log("Using cached updates.");
+            return cached_updates;
+        }
+    }
+
+    if (!force && m_update_future.valid()) {
+        m_update_future.wait();
+        std::lock_guard<std::mutex> lock(m_updates_mutex);
+        if (cached_updates.has_value()) {
+            logger.log("Using cached updates (waited for background check).");
+            return cached_updates;
+        }
+    }
+
+    return fetch_updates_from_network();
 }
 
 std::string head::library_updater::re_check_for_updates()
@@ -170,47 +199,7 @@ std::weak_ptr<head::plugin_installer> head::library_updater::get_plugin_updater(
 
 void head::library_updater::set_ipc_main(std::shared_ptr<ipc_main> ipc_main)
 {
-    m_ipc_main = ipc_main;
-
-    m_push_future = std::async(std::launch::async, [self = shared_from_this(), ipc = std::move(ipc_main)]()
-    {
-        if (self->m_update_future.valid()) {
-            self->m_update_future.wait();
-        }
-
-        auto cdp = ipc->get_cdp_client();
-        cdp->wait_for_shared_js_session();
-
-        if (!cdp->is_active()) return;
-
-        /* pump until frontend is loaded */
-        for (int attempt = 0; attempt < 20; ++attempt) {
-            auto result = self->push_updates_to_frontend();
-            if (result) return;
-
-            std::this_thread::sleep_for(std::chrono::milliseconds(250));
-        }
-        logger.warn("push_updates_to_frontend: gave up waiting for frontend to load");
-    });
-}
-
-bool head::library_updater::push_updates_to_frontend()
-{
-    auto ipc = m_ipc_main;
-    if (!ipc) return false;
-
-    std::optional<json> updates;
-    {
-        std::lock_guard<std::mutex> lock(m_updates_mutex);
-        updates = cached_updates;
-    }
-    if (!updates) return false;
-
-    std::string themes_json = updates->value("themes", json::array()).dump();
-    std::string plugins_json = updates->value("plugins", json::array()).dump();
-
-    std::vector<ipc_main::javascript_parameter> params = { themes_json, plugins_json };
-    return ipc->evaluate_javascript_expression(ipc->compile_javascript_expression("core", "LibraryUpdatesEmitter", params)).ok();
+    m_ipc_main = std::move(ipc_main);
 }
 
 // Thread-local state for per-operation progress dispatching.

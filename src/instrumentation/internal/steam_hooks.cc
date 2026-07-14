@@ -42,15 +42,15 @@
 #include <sys/eventfd.h>
 #include <sys/stat.h>
 #include <unistd.h>
-#elif _WIN32
-#include "millennium/filesystem.h"
 #endif
+#include "millennium/filesystem.h" // IWYU pragma: keep
 
 #include "millennium/logger.h"
 #include "millennium/steam_hooks.h"
 #include "millennium/cmdline_api.h"
 #include "millennium/cmdline_parser.h"
 #include "millennium/millennium_lifecycle.h"
+#include "instrumentation/loopback_ipc.h"
 
 std::mutex g_cdp_pipe_mutex;
 std::condition_variable g_cdp_pipe_cv;
@@ -58,8 +58,15 @@ std::atomic<bool> g_cdp_pipes_ready{ false };
 int g_cdp_pipe_generation = 0;
 
 #ifdef _WIN32
+#include <thread>
 HANDLE g_cdp_pipe_read = INVALID_HANDLE_VALUE;
 HANDLE g_cdp_pipe_write = INVALID_HANDLE_VALUE;
+HANDLE g_cdp_child_read = INVALID_HANDLE_VALUE;
+HANDLE g_cdp_child_write = INVALID_HANDLE_VALUE;
+static HANDLE g_lb_child_read = INVALID_HANDLE_VALUE;
+static HANDLE g_lb_child_write = INVALID_HANDLE_VALUE;
+static std::thread g_pipe_drain_thread;
+static std::atomic<bool> g_pipe_drain_stop{ false };
 #elif __linux__
 int g_cdp_pipe_read_fd = -1;
 int g_cdp_pipe_write_fd = -1;
@@ -70,6 +77,8 @@ int g_cdp_pipe_change_efd = -1;
 static std::string g_pv_shim_dir;
 static std::string g_cdp_cmd_fifo;
 static std::string g_cdp_resp_fifo;
+static std::string g_lb_ipc_cmd_fifo;
+static std::string g_lb_ipc_resp_fifo;
 
 static std::string find_pvs64_binary()
 {
@@ -100,6 +109,16 @@ static void cleanup_pv_shim()
         g_cdp_resp_fifo.clear();
     }
 
+    if (!g_lb_ipc_cmd_fifo.empty()) {
+        unlink(g_lb_ipc_cmd_fifo.c_str());
+        g_lb_ipc_cmd_fifo.clear();
+    }
+
+    if (!g_lb_ipc_resp_fifo.empty()) {
+        unlink(g_lb_ipc_resp_fifo.c_str());
+        g_lb_ipc_resp_fifo.clear();
+    }
+
     rmdir(g_pv_shim_dir.c_str());
     g_pv_shim_dir.clear();
 }
@@ -110,6 +129,8 @@ static bool create_pv_shim()
 
     int command_fd = -1;
     int response_fd = -1;
+    int lb_cmd_fd = -1;
+    int lb_resp_fd = -1;
 
     char tmp[] = "/tmp/.millennium-pv-XXXXXX";
     const char* mkd_temp_directory = mkdtemp(tmp);
@@ -123,20 +144,25 @@ static bool create_pv_shim()
     std::string binary_directory = shim_directory + "/bin";
     std::string command_fifo_directory = shim_directory + "/cmd.fifo";
     std::string response_fifo_directory = shim_directory + "/resp.fifo";
+    std::string lb_cmd_fifo_path = shim_directory + "/lb-cmd.fifo";
+    std::string lb_resp_fifo_path = shim_directory + "/lb-resp.fifo";
 
     if (mkdir(binary_directory.c_str(), 0755) < 0) {
         goto cleanup;
     }
 
-    if (mkfifo(command_fifo_directory.c_str(), 0600) < 0 || mkfifo(response_fifo_directory.c_str(), 0600) < 0) {
+    if (mkfifo(command_fifo_directory.c_str(), 0600) < 0 || mkfifo(response_fifo_directory.c_str(), 0600) < 0 || mkfifo(lb_cmd_fifo_path.c_str(), 0600) < 0 ||
+        mkfifo(lb_resp_fifo_path.c_str(), 0600) < 0) {
         LOG_ERROR("create_pv_shim: mkfifo failed (errno {})", errno);
         goto cleanup;
     }
 
     command_fd = open(command_fifo_directory.c_str(), O_RDWR | O_CLOEXEC);
     response_fd = open(response_fifo_directory.c_str(), O_RDWR | O_CLOEXEC);
+    lb_cmd_fd = open(lb_cmd_fifo_path.c_str(), O_RDWR | O_CLOEXEC);
+    lb_resp_fd = open(lb_resp_fifo_path.c_str(), O_RDWR | O_CLOEXEC);
 
-    if (command_fd < 0 || response_fd < 0) {
+    if (command_fd < 0 || response_fd < 0 || lb_cmd_fd < 0 || lb_resp_fd < 0) {
         LOG_ERROR("create_pv_shim: open FIFO failed (errno {})", errno);
         goto cleanup;
     }
@@ -145,6 +171,11 @@ static bool create_pv_shim()
     g_cdp_pipe_read_fd = response_fd;
     g_cdp_cmd_fifo = command_fifo_directory;
     g_cdp_resp_fifo = response_fifo_directory;
+    g_lb_ipc_cmd_fifo = lb_cmd_fifo_path;
+    g_lb_ipc_resp_fifo = lb_resp_fifo_path;
+
+    register_loopback_conn(lb_cmd_fd, lb_resp_fd);
+
     {
         std::string pvs64 = find_pvs64_binary();
         if (pvs64.empty()) {
@@ -165,15 +196,30 @@ static bool create_pv_shim()
 cleanup:
     if (command_fd >= 0) close(command_fd);
     if (response_fd >= 0) close(response_fd);
+    if (lb_cmd_fd >= 0) close(lb_cmd_fd);
+    if (lb_resp_fd >= 0) close(lb_resp_fd);
 
     unlink(command_fifo_directory.c_str());
     unlink(response_fifo_directory.c_str());
+    unlink(lb_cmd_fifo_path.c_str());
+    unlink(lb_resp_fifo_path.c_str());
     rmdir(binary_directory.c_str());
     rmdir(mkd_temp_directory);
 
     return false;
 }
 #endif /* __linux__ */
+
+#ifdef _WIN32
+void stop_pipe_drain()
+{
+    g_pipe_drain_stop = true;
+    if (g_pipe_drain_thread.joinable()) {
+        CancelSynchronousIo(reinterpret_cast<HANDLE>(g_pipe_drain_thread.native_handle()));
+        g_pipe_drain_thread.join();
+    }
+}
+#endif
 
 const char* Plat_HookedCreateSimpleProcess(const char* cmd)
 {
@@ -182,6 +228,7 @@ const char* Plat_HookedCreateSimpleProcess(const char* cmd)
         return cmd;
     }
 
+    logger.log("Plat_HookedCreateSimpleProcess: cmd = {}", cmd);
     command cmd_line(cmd);
 
     const char* target_executable =
@@ -194,6 +241,7 @@ const char* Plat_HookedCreateSimpleProcess(const char* cmd)
 #endif
 
     if (cmd_line.executable() != target_executable) {
+        logger.log("dispatching: {}", cmd_line.exec);
         return cmd;
     }
 
@@ -204,6 +252,7 @@ const char* Plat_HookedCreateSimpleProcess(const char* cmd)
     bool is_developer_mode = CommandLineArguments::has_argument("-dev");
 
     cmd_line.ensure_param("--enable-unsafe-extension-debugging");
+    cmd_line.ensure_param("--disable-blink-features", "AutomationControlled");
 
     if (is_developer_mode) {
         cmd_line.ensure_param("--remote-allow-origins", "*");
@@ -213,6 +262,24 @@ const char* Plat_HookedCreateSimpleProcess(const char* cmd)
 
 #ifdef _WIN32
     {
+        stop_pipe_drain();
+        if (g_cdp_pipe_read != INVALID_HANDLE_VALUE) {
+            CloseHandle(g_cdp_pipe_read);
+            g_cdp_pipe_read = INVALID_HANDLE_VALUE;
+        }
+        if (g_cdp_pipe_write != INVALID_HANDLE_VALUE) {
+            CloseHandle(g_cdp_pipe_write);
+            g_cdp_pipe_write = INVALID_HANDLE_VALUE;
+        }
+        if (g_cdp_child_read != INVALID_HANDLE_VALUE) {
+            CloseHandle(g_cdp_child_read);
+            g_cdp_child_read = INVALID_HANDLE_VALUE;
+        }
+        if (g_cdp_child_write != INVALID_HANDLE_VALUE) {
+            CloseHandle(g_cdp_child_write);
+            g_cdp_child_write = INVALID_HANDLE_VALUE;
+        }
+
         SECURITY_ATTRIBUTES sa = { sizeof(sa), nullptr, TRUE };
 
         HANDLE hChildRead = INVALID_HANDLE_VALUE, hParentWrite = INVALID_HANDLE_VALUE;
@@ -230,9 +297,26 @@ const char* Plat_HookedCreateSimpleProcess(const char* cmd)
 
             g_cdp_pipe_read = hParentRead;
             g_cdp_pipe_write = hParentWrite;
+            g_cdp_child_read = hChildRead;
+            g_cdp_child_write = hChildWrite;
 
             logger.log("CDP pipes created (child read={}, child write={}, parent read={}, parent write={})", reinterpret_cast<uintptr_t>(hChildRead),
                        reinterpret_cast<uintptr_t>(hChildWrite), reinterpret_cast<uintptr_t>(hParentRead), reinterpret_cast<uintptr_t>(hParentWrite));
+
+            g_pipe_drain_stop = false;
+            g_pipe_drain_thread = std::thread([hRead = hParentRead]()
+            {
+                char buf[4096];
+                DWORD bytesRead = 0;
+                while (!g_pipe_drain_stop.load(std::memory_order_acquire)) {
+                    BOOL ok = ReadFile(hRead, buf, sizeof(buf), &bytesRead, nullptr);
+                    if (!ok) {
+                        DWORD err = GetLastError();
+                        if (err == ERROR_BROKEN_PIPE || err == ERROR_INVALID_HANDLE || err == ERROR_OPERATION_ABORTED) break;
+                    }
+                }
+                logger.log("CDP pipe drain thread exited.");
+            });
 
             {
                 std::lock_guard<std::mutex> lock(g_cdp_pipe_mutex);
@@ -245,12 +329,39 @@ const char* Plat_HookedCreateSimpleProcess(const char* cmd)
             if (hChildRead != INVALID_HANDLE_VALUE) CloseHandle(hChildRead);
             if (hParentWrite != INVALID_HANDLE_VALUE) CloseHandle(hParentWrite);
         }
+
+        /* loopback IPC pipes: host writes patch lists, reads log/patch_event */
+        {
+            HANDLE hLbChildRead = INVALID_HANDLE_VALUE, hLbParentWrite = INVALID_HANDLE_VALUE;
+            HANDLE hLbParentRead = INVALID_HANDLE_VALUE, hLbChildWrite = INVALID_HANDLE_VALUE;
+            SECURITY_ATTRIBUTES sa2 = { sizeof(sa2), nullptr, TRUE };
+
+            bool lb_ok = CreatePipe(&hLbChildRead, &hLbParentWrite, &sa2, 0) && CreatePipe(&hLbParentRead, &hLbChildWrite, &sa2, 0);
+
+            if (lb_ok) {
+                SetHandleInformation(hLbParentWrite, HANDLE_FLAG_INHERIT, 0);
+                SetHandleInformation(hLbParentRead, HANDLE_FLAG_INHERIT, 0);
+
+                cmd_line.ensure_param("--millennium-loopback-ipc-handles",
+                                      std::format("{},{}", reinterpret_cast<uintptr_t>(hLbChildRead), reinterpret_cast<uintptr_t>(hLbChildWrite)).c_str());
+
+                g_lb_child_read = hLbChildRead;
+                g_lb_child_write = hLbChildWrite;
+
+                register_loopback_conn(hLbParentWrite, hLbParentRead);
+            } else {
+                LOG_ERROR("Failed to create loopback IPC pipes (error {}).", GetLastError());
+                if (hLbChildRead != INVALID_HANDLE_VALUE) CloseHandle(hLbChildRead);
+                if (hLbParentWrite != INVALID_HANDLE_VALUE) CloseHandle(hLbParentWrite);
+            }
+        }
     }
 #elif __linux__
     {
         cmd_line.ensure_param("--remote-debugging-pipe");
 
         if (create_pv_shim()) {
+            cmd_line.ensure_param("--millennium-loopback-ipc-fds", "5,6");
             cmd_line.params.insert(cmd_line.params.begin(), cmd_line.exec);
             cmd_line.params.insert(cmd_line.params.begin(), "PRESSURE_VESSEL_PREFIX=" + g_pv_shim_dir);
             cmd_line.exec = "/usr/bin/env";
@@ -318,9 +429,73 @@ BOOL WINAPI hooked_create_process_internal_w(HANDLE hUserToken, LPCWSTR lpApplic
     if (g_cdp_pipes_ready.load(std::memory_order_acquire) && lpCommandLine) {
         std::wstring cmd(lpCommandLine);
         if (cmd.find(L"steamwebhelper") != std::wstring::npos) {
-            BOOL prev = bInheritHandles;
-            bInheritHandles = TRUE;
-            logger.log("CreateProcessInternalW hook fired for steamwebhelper (bInheritHandles: {} -> TRUE, dwCreationFlags: 0x{:X})", prev, dwCreationFlags);
+            logger.log("CreateProcessInternalW hook fired for steamwebhelper (bInheritHandles: {} -> TRUE, dwCreationFlags: 0x{:X})", bInheritHandles, dwCreationFlags);
+
+            std::vector<HANDLE> inherit_handles;
+            if (g_cdp_child_read != INVALID_HANDLE_VALUE) inherit_handles.push_back(g_cdp_child_read);
+            if (g_cdp_child_write != INVALID_HANDLE_VALUE) inherit_handles.push_back(g_cdp_child_write);
+            if (g_lb_child_read != INVALID_HANDLE_VALUE) inherit_handles.push_back(g_lb_child_read);
+            if (g_lb_child_write != INVALID_HANDLE_VALUE) inherit_handles.push_back(g_lb_child_write);
+
+            SIZE_T attr_size = 0;
+            InitializeProcThreadAttributeList(nullptr, 1, 0, &attr_size);
+            auto attr_buf = std::make_unique<char[]>(attr_size);
+            auto attr_list = reinterpret_cast<LPPROC_THREAD_ATTRIBUTE_LIST>(attr_buf.get());
+
+            bool attr_init_ok = InitializeProcThreadAttributeList(attr_list, 1, 0, &attr_size);
+            if (attr_init_ok &&
+                UpdateProcThreadAttribute(attr_list, 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST, inherit_handles.data(), inherit_handles.size() * sizeof(HANDLE), nullptr, nullptr)) {
+                STARTUPINFOEXW siex{};
+                siex.StartupInfo = *lpStartupInfo;
+                siex.StartupInfo.cb = sizeof(STARTUPINFOEXW);
+                siex.lpAttributeList = attr_list;
+
+                BOOL result = orig(hUserToken, lpApplicationName, lpCommandLine, lpProcessAttributes, lpThreadAttributes, TRUE, dwCreationFlags | EXTENDED_STARTUPINFO_PRESENT,
+                                   lpEnvironment, lpCurrentDirectory, reinterpret_cast<LPSTARTUPINFOW>(&siex), lpProcessInformation, hNewToken);
+
+                DeleteProcThreadAttributeList(attr_list);
+
+                if (g_cdp_child_read != INVALID_HANDLE_VALUE) {
+                    CloseHandle(g_cdp_child_read);
+                    g_cdp_child_read = INVALID_HANDLE_VALUE;
+                }
+                if (g_cdp_child_write != INVALID_HANDLE_VALUE) {
+                    CloseHandle(g_cdp_child_write);
+                    g_cdp_child_write = INVALID_HANDLE_VALUE;
+                }
+                if (g_lb_child_read != INVALID_HANDLE_VALUE) {
+                    CloseHandle(g_lb_child_read);
+                    g_lb_child_read = INVALID_HANDLE_VALUE;
+                }
+                if (g_lb_child_write != INVALID_HANDLE_VALUE) {
+                    CloseHandle(g_lb_child_write);
+                    g_lb_child_write = INVALID_HANDLE_VALUE;
+                }
+                return result;
+            }
+
+            if (attr_init_ok) DeleteProcThreadAttributeList(attr_list);
+            LOG_ERROR("Failed to build PROC_THREAD_ATTRIBUTE_HANDLE_LIST (error {}), falling back to full inherit.", GetLastError());
+
+            BOOL result = orig(hUserToken, lpApplicationName, lpCommandLine, lpProcessAttributes, lpThreadAttributes, TRUE, dwCreationFlags, lpEnvironment, lpCurrentDirectory,
+                               lpStartupInfo, lpProcessInformation, hNewToken);
+            if (g_cdp_child_read != INVALID_HANDLE_VALUE) {
+                CloseHandle(g_cdp_child_read);
+                g_cdp_child_read = INVALID_HANDLE_VALUE;
+            }
+            if (g_cdp_child_write != INVALID_HANDLE_VALUE) {
+                CloseHandle(g_cdp_child_write);
+                g_cdp_child_write = INVALID_HANDLE_VALUE;
+            }
+            if (g_lb_child_read != INVALID_HANDLE_VALUE) {
+                CloseHandle(g_lb_child_read);
+                g_lb_child_read = INVALID_HANDLE_VALUE;
+            }
+            if (g_lb_child_write != INVALID_HANDLE_VALUE) {
+                CloseHandle(g_lb_child_write);
+                g_lb_child_write = INVALID_HANDLE_VALUE;
+            }
+            return result;
         }
     }
 
@@ -524,6 +699,7 @@ bool initialize_steam_hooks()
 
 void uninitialize_steam_hooks()
 {
+    stop_pipe_drain();
     if (g_rdcw_hook) {
         snare_inline_remove(g_rdcw_hook);
         snare_inline_free(g_rdcw_hook);
@@ -563,6 +739,7 @@ extern "C" int hooked_create_simple_process(const char* cmd, unsigned int a2, co
     auto orig = reinterpret_cast<int (*)(const char*, unsigned int, const char*)>(create_hook.get_trampoline());
     int result = orig(cmd, a2, a3);
 
+    logger.log("[hooked_create_simple_process]: {}", cmd);
     return result;
 }
 

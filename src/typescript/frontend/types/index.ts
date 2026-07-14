@@ -28,7 +28,7 @@
  * SOFTWARE.
  */
 
-import { ConfirmModalProps, ShowModalResult, SingleDropdownOption } from '@steambrew/client';
+import { ConfirmModalProps, ShowModalResult, SingleDropdownOption } from '@steambrew/sdk';
 
 export interface Patch {
 	MatchRegexString: string;
@@ -141,7 +141,6 @@ export interface Plugin {
 	common_name?: string;
 	name: string;
 	description?: string;
-	venv?: string;
 	version?: string;
 	useBackend?: boolean;
 	backendType?: string;
